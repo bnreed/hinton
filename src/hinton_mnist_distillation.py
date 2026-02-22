@@ -17,6 +17,7 @@ Usage:
 # Imports
 # ---------------------------------------------------------------------------
 
+import os                                  # for creating directories
 import torch                              # the core PyTorch library
 import torch.nn as nn                     # building blocks for neural networks (layers, etc.)
 import torch.nn.functional as F           # stateless functions: relu, softmax, cross_entropy, etc.
@@ -37,6 +38,7 @@ TEMPERATURE     = 8.0     # T in Equation 1; higher = softer probability distrib
 ALPHA           = 0.9     # weight on soft loss; (1-ALPHA) goes to hard loss
                           # paper recommends close to 1.0 so soft targets dominate
 SEED            = 42      # random seed for reproducibility
+SAVE_DIR        = "./saved_models"  # directory where trained models will be written
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                           # use a GPU if one is available, otherwise fall back to CPU
                           # torch.cuda.is_available() returns True if CUDA GPU is detected
@@ -380,6 +382,88 @@ def evaluate(model, loader, label="Model"):
 
 
 # ---------------------------------------------------------------------------
+# Saving and loading
+# ---------------------------------------------------------------------------
+
+def save_model(model, optimizer, epoch, errors, filename):
+    """
+    Saves a model checkpoint to disk so training can be resumed later
+    or the model can be reloaded without retraining.
+
+    PyTorch convention is to save a "checkpoint" dict containing:
+      - model state dict   : all the learned weights and biases
+      - optimizer state    : momentum/variance terms so training can resume
+                             smoothly from exactly where it left off
+      - metadata           : anything else useful (epoch, errors, config)
+
+    Args:
+        model     : the trained PyTorch model (nn.Module)
+        optimizer : the optimizer used during training
+        epoch     : how many epochs were trained (for resuming)
+        errors    : test error count (for reference)
+        filename  : full path to save to, e.g. "./saved_models/teacher.pt"
+    """
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    # os.makedirs creates the directory (and any parent dirs) if it doesn't exist.
+    # exist_ok=True means don't raise an error if it already exists.
+
+    checkpoint = {
+        "model_state_dict"    : model.state_dict(),
+        # state_dict() returns an OrderedDict of all parameters and buffers.
+        # Keys are layer names like "fc1.weight", "fc1.bias", etc.
+        # Values are tensors containing the actual learned values.
+        # This is what you need to restore the model's learned behavior.
+
+        "optimizer_state_dict": optimizer.state_dict(),
+        # Saves the optimizer's internal state (e.g. Adam's running averages).
+        # Only needed if you want to resume training — not needed for inference.
+
+        "epoch"               : epoch,
+        "test_errors"         : errors,
+        "temperature"         : TEMPERATURE,
+        "alpha"               : ALPHA,
+    }
+
+    torch.save(checkpoint, filename)
+    # torch.save uses Python's pickle under the hood to serialize the dict.
+    # .pt and .pth are both conventional extensions for PyTorch checkpoints.
+
+    print(f"  Saved to {filename}")
+
+
+def load_model(model, filename, optimizer=None):
+    """
+    Restores a saved model from a checkpoint file.
+
+    Args:
+        model     : an instantiated (but untrained) model of the correct architecture.
+                    The architecture must match what was saved — PyTorch saves weights,
+                    not the architecture itself, so you must recreate the structure first.
+        filename  : path to the .pt checkpoint file
+        optimizer : optional — pass in if you want to resume training.
+                    Skip if you only need the model for inference.
+
+    Returns:
+        The checkpoint dict (contains epoch, errors, etc.)
+    """
+    checkpoint = torch.load(filename, map_location=DEVICE)
+    # map_location=DEVICE handles the case where the model was saved on GPU
+    # but is being loaded on CPU (or vice versa).
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    # Copies the saved weights back into the model layer by layer.
+    # After this call, model behaves identically to how it did when saved.
+
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        # Restores optimizer state so training can resume without a "warm-up" period.
+
+    print(f"  Loaded from {filename} (epoch {checkpoint['epoch']}, "
+          f"errors {checkpoint['test_errors']})")
+    return checkpoint
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -414,6 +498,8 @@ def main():
 
     print("\nTeacher evaluation:")
     teacher_errors = evaluate(teacher, test_loader, "Teacher")
+    save_model(teacher, teacher_opt, TEACHER_EPOCHS, teacher_errors,
+               f"{SAVE_DIR}/teacher.pt")
 
     # -----------------------------------------------------------------------
     # Step 2: Train student WITH distillation (the paper's main result)
@@ -433,6 +519,8 @@ def main():
     print("\nDistilled student evaluation:")
     print("(temperature set to 1 at inference — standard softmax)")
     distilled_errors = evaluate(student_distilled, test_loader, "Distilled Student")
+    save_model(student_distilled, student_dist_opt, STUDENT_EPOCHS, distilled_errors,
+               f"{SAVE_DIR}/student_distilled.pt")
 
     # -----------------------------------------------------------------------
     # Step 3: Train student WITHOUT distillation (the baseline to beat)
@@ -455,6 +543,8 @@ def main():
 
     print("\nBaseline student evaluation:")
     baseline_errors = evaluate(student_baseline, test_loader, "Baseline Student")
+    save_model(student_baseline, student_base_opt, STUDENT_EPOCHS, baseline_errors,
+               f"{SAVE_DIR}/student_baseline.pt")
 
     # -----------------------------------------------------------------------
     # Summary
